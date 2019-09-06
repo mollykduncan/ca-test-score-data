@@ -1,0 +1,112 @@
+---
+title: "Extracting California's Standardized Testing Data"
+author: "MKD"
+date: "August 14, 2019"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(here)
+options(stringsAsFactors = FALSE)
+```
+
+Similar to the previous post about extracting New York state's education data, this post is about programmatically extracting school-level standardized test results from a state's DOE website--in this case, the state of California. Luckily, California reports their data all the way back to 2003 in .csv files, which means we can write a little more elegant script to extract *all* of it, instead of the piecemeal approach we had to take with New York's data. 
+
+You can find links to all of California's data [here](https://www.cde.ca.gov/ds/dd/). Results from the tests used between the 2002-2003 school year and the 2012-2013 school year, the STAR program, are [here](https://star.cde.ca.gov/starresearchfiles.asp), and more recent results, from CAASP, are [here](https://caaspp.cde.ca.gov/sb2018/ResearchFileList?ps=true&lstTestType=B&lstCounty=00&lstCntyNam=Select%20County...&lstTestYear=2015). There's a [one-year gap](https://www.ed-data.org/article/Changes-to-California's-K--12-Education-System) for the 2013-2014 school year, when the new assessment system was being "field tested". 
+
+We'll start with pulling the more recent results and work backwards.
+
+Our basic approach is as follows:
+
+1. Construct a vector containing strings that are the links of the zip files
+2. Create a temporary directory to load the files into[^1]
+3. Write a function that uses `download.file()` and `unzip()` to process all the links, then `lapply()` the function to our vector of file links and `unlist()` the output back to a vector[^2], and finally
+4. `lapply()` the function `read.table()` to our vector of files so that we get back a list of dataframes, where each dataframe is one of the .csvs.
+
+```{r construct-for-recent}
+recent_files <- str_c('http://www3.cde.ca.gov/caasppresearchfiles/2018/sb/sb_ca20', 18:15, 
+                      '_all_csv_v', c(3,2,3,3), '.zip')
+td <- tempdir()
+```
+```{r create-function}
+dl_and_unz <- function(x){
+  temp <- tempfile(tmpdir = td)
+  download.file(x, temp, mode = 'wb')
+  unzip(temp, exdir = td, overwrite = TRUE)
+}
+```
+```{r recent-files-use-function}
+file_list <- lapply(recent_files, dl_and_unz) %>% 
+  unlist()
+dat_list <- lapply(subset(file_list, str_detect(file_list, '_all_') == TRUE), 
+              function(x){read.table(x, sep = ',', header = T, colClasses = 'character')})
+```
+
+You'll notice that `lapply()` actually only uses a subset of the file names. That's because each zip folder contained two files. One file was the actual data, and that's the one our function is after. In those files, each school is identified by an ID number assigned by the state. The second file in the zip folder is a file that links each school ID to other information, like the school name and address. That could definitely be useful depending on your plans for the data, but in my case I'll later be linking this data to [school attendance boundary survey](http://data-nces.opendata.arcgis.com/datasets/school-attendance-boundary-survey-2013-2014) files from NCES, and I already know where to find a [file](https://nces.ed.gov/ccd/pubschuniv.asp) that links the state's ID number to the NCES ID number, so I don't need that linking file from California's data.
+
+You may also notice that I'm reading all columns in as character variables. That's not as efficient as letting R decide to read some variables as simpler classes (e.g. numeric), but in my experience, archival data from state DOEs is a mess of inconsistently recorded data, and reading everything in as character variables will allow us to go through later and identify problems. (Problems like, for example, that missing values may have been recorded with different indicators in different years, or that one year someone thought it would be fun to hand-enter comma separators into large numbers[^3].)
+
+Before we work on cleaning up these files, let's make sure the columns are all the same so we know what we're working with.
+```{r colnames}
+lapply(dat_list, colnames)
+```
+It looks like our only problem is that two of the dataframes have an extra column, `Total.CAASPP.Enrollment`, which we can drop. 
+```{r drop-columns-if}
+dat_list <- lapply(dat_list, function(x){
+  if('Total.CAASPP.Enrollment' %in% colnames(x)){select(x, -Total.CAASPP.Enrollment)}else{x}})
+```
+
+And now we can join them all to a single dataframe and stop wrapping everything in `lapply` :)
+```{r bind-dfs}
+dat <- bind_rows(dat_list)
+rm(dat_list)
+
+```
+
+Now, these dataframes are BIG, so before I save them I'd like to cut out the data I don't intend to use. Namely, there are some subgroup classifications I'm not interested in, and I don't want state-, county-, or district-level records, just the records associated with a specific school. You can find the lookup tables I'm using to figure out which of the numeric codes I wanted to keep on [the page where the data is posted](https://caaspp.cde.ca.gov/sb2018/ResearchFileList?ps=true&lstTestType=B&lstCounty=00&lstCntyNam=Select%20County...&lstTestYear=2015). 
+
+```{r subgroup-lookup-tables}
+lookup_link <- dl_and_unz('http://www3.cde.ca.gov/caasppresearchfiles/2018/sb/subgroups.zip')
+lookup <- read.table(lookup_link, sep = ',', colClasses = 'character')
+colnames(lookup) <- c('Subgroup.ID', 'Duplicate.Var', 'Subgroup', 'Subgroup.Category')
+lookup <- select(lookup, -Duplicate.Var)
+```
+
+Next, we'll join the tables, cut out the records we don't want, and drop some variables. 
+```{r join-tables}
+SubgroupsIWant <- c('1', # all students
+  '31', # economically disadvantaged
+  '74', # black or african american
+  '75', # american indian or alaska native
+  '76', # asian
+  '77', # filipino
+  '78', # hispanic or latino
+  '79', # native hawaiian or pacific islander
+  '80', # white
+  '111', # not economically disadvantaged
+  '144' # two or more races
+  )
+
+dat <- left_join(dat, lookup) %>% 
+  filter(Subgroup.ID %in% SubgroupsIWant &
+           School.Code != '0000000' &
+          # some grades I don't want are included in the file, including "13" for all grades
+           Grade != '11' &
+           Grade != '13') %>% 
+  select(-Filler, -Test.Type, -Total.Tested.At.Entity.Level, -CAASPP.Reported.Enrollment, -Students.Tested,
+         -(Students.with.Scores:Area.4.Percentage.At.or.Near.Standard)) 
+
+```
+This dataset isn't quite in its final form yet. For example, there are some variables that are currently character vectors that I'll want to be numeric (more on that later). But it's a good enough form to join it to the older datasets, and then we can do some more data cleaning on the single, joined dataset. So at this point, I'm going to write this dataset to disc as a couple of CSVs (because writing it as a single csv makes it just over the threshold of file sizes github will allow), and we'll call it a day.
+```{r write-data}
+write_csv(filter(dat, Test.Year %in% c('2018', '2017')), path = here('data', 'raw', 'CA20172018.csv'))
+write_csv(filter(dat, Test.Year %in% c('2015', '2016')), path = here('data', 'raw', 'CA20152016.csv'))
+```
+
+
+
+[^1]: The benefit of loading these files into a temporary file is that we can dump everything from every zip file in there, and the whole directory will automatically be erased when we end our R session. That saves us the work of deleting all the files we don't intend to use. In general, it's good practice keep all of the raw data in your project somewhere, but since this project is going to have so *much* data, I'm going to go a little wild and only store pre-processed (and considerably winnowed down) data files. But since my data extraction method is a script that I can re-run anytime I want, I'd argue I'm still making my analysis perfectly reproducible.
+[^2]: The function we write basically does two things: (1) outside of R, in the temporary directory, it unzips all the files to make them readable for R, and (2) inside of R, it returns a list (because we use `lapply()`) of the file names.
+[^3]: Don't skeptically raise your eyebrows at me like that, someone in Georgia's DOE really did manually enter comma separators in all the data files for a few years.
